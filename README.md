@@ -28,7 +28,8 @@ This bot downloads media from 1000+ platforms using yt-dlp and uploads the files
 - Audio-only sources (e.g. SoundCloud) are auto-detected and always fetched as tagged MP3
 - Direct media URLs (e.g. an imageboard `.webm`) are transcoded to a streamable MP4 (H.264/AAC, `moov` at the start) so Telegram plays them inline instead of attaching as a file
 - Audio results are a single post: MP3 with embedded cover art, album-art thumbnail, and title/artist/duration
-- Each result post shows the original source URL as plain (non-linked) text
+- Each result post is captioned *Post by AUTHOR on PLATFORM*, linking the original post and the author's profile
+- Short clips (under 60s) whose source has no sound are sent as animations, so they autoplay and loop like a GIF
 - Authenticated downloads via browser cookies (bare Python) or a mounted `cookies.txt` (Docker)
 - Handles split video+audio sources (HLS/DASH) that have no single muxed stream
 - Optional headless-browser fallback: when no yt-dlp extractor can handle a page whose player builds the media URL in JavaScript, the page is loaded in headless Chromium, the media request is captured, and that URL is handed back to yt-dlp
@@ -244,16 +245,18 @@ Send the bot any media **URL** (or up to 3 URLs in one message) and it downloads
 | `/formats <url>` | Show inline buttons to pick a download quality (Best / 1080p / 720p / 480p / Audio) |
 | `/status` | Show your queued/active downloads and their task IDs |
 | `/cancel <task_id>` | Cancel one of your active downloads (get the ID from `/status`) |
-| `/minimal on\|off` | Toggle minimal UI for this chat — no status/progress messages, no caption on media |
+| `/minimal on\|off` | Toggle minimal UI for this chat (on by default) — no status/progress messages, just the finished post |
 | `/topic lock\|unlock\|status` | Restrict the bot to one forum topic in this group (see [Use in groups](#use-in-groups)) |
 
 Notes:
 - `/audio` and `/video` set a **per-user** preference that persists until changed.
 - A download is queued per URL; `/status` reports each one's task ID, which `/cancel` consumes.
 - Per-user concurrency is bounded by `RATE_LIMIT_PER_USER`; the global cap is `MAX_PARALLEL_DOWNLOADS`.
-- **Audio posts** are a single message: the MP3 with embedded cover art, an album-art thumbnail in the player, title/artist/duration tags, and the source URL in the caption. (Telegram doesn't allow a standalone photo and an audio file in one post, so the cover rides along as the player thumbnail.)
+- **Audio posts** are a single message: the MP3 with embedded cover art, an album-art thumbnail in the player, title/artist/duration tags, and the standard caption. (Telegram doesn't allow a standalone photo and an audio file in one post, so the cover rides along as the player thumbnail.)
 - **SoundCloud links are always audio** — no need to send `/audio` first.
-- **Every post** includes the original source URL as monospace, non-linked text — copyable, but Telegram won't turn it into a link or fetch a preview.
+- **Every post** is captioned *[Post](#) by [AUTHOR](#) on PLATFORM* (italic): "Post" links to the original, the author name (from yt-dlp's uploader, falling back to channel) links to their profile. With no known author it's just *Post on PLATFORM*.
+- **Short silent clips** (under 60s, where the source itself has no sound per yt-dlp's format info, or the file has no audio track when the source doesn't say) are sent as animations so they autoplay and loop like a GIF.
+- **Minimal mode is the default:** no queued/progress/"Done!" messages, just the finished post. `/minimal off` restores them for a chat.
 
 See [Command Reference](COMMANDS.md) for full examples and sample responses.
 

@@ -1,10 +1,15 @@
 """Persistent per-chat toggle for minimal UI mode.
 
-When enabled for a chat, the bot suppresses routine progress/status messages
-(queued, downloading, uploading, "Done!") and the title/source-URL caption on
-uploaded media — only the media itself is sent. Failures are still reported.
-IDs persist to a JSON file (``MINIMAL_MODE_FILE``) so the setting survives
-restarts; with no file configured the store is in-memory only.
+Minimal mode is the **default**: the bot suppresses routine progress/status
+messages (queued, downloading, uploading, "Done!") so only the finished post
+appears. Failures are still reported. A chat can opt out with ``/minimal off``
+to get the status messages back.
+
+Opted-out chat IDs persist to a JSON file (``MINIMAL_MODE_FILE``) as
+``{"verbose": [ids]}`` so the setting survives restarts; with no file
+configured the store is in-memory only. The legacy format (a bare list of
+chats that had turned minimal mode *on*) is read as "no opt-outs", since those
+chats already match the new default.
 """
 
 import json
@@ -17,11 +22,11 @@ logger = get_logger()
 
 
 class MinimalModeStore:
-    """A set of chat IDs with minimal UI mode enabled, optionally file-backed."""
+    """Tracks chats that opted out of (default-on) minimal mode, optionally file-backed."""
 
     def __init__(self, path: str = ""):
         self._path: Optional[Path] = Path(path) if path else None
-        self._chats: set[int] = set()
+        self._verbose: set[int] = set()
         self._load()
 
     def _load(self) -> None:
@@ -29,21 +34,24 @@ class MinimalModeStore:
             return
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-            self._chats = {int(c) for c in data}
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            if isinstance(data, dict):
+                self._verbose = {int(c) for c in data.get("verbose", [])}
+            # A bare list is the legacy "minimal on" set — all default now.
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError) as e:
             logger.error(f"Could not read minimal-mode file {self._path}: {e}")
 
     def contains(self, chat_id: int) -> bool:
-        return chat_id in self._chats
+        """True if minimal mode is on for this chat (the default)."""
+        return chat_id not in self._verbose
 
     def set(self, chat_id: int, enabled: bool) -> None:
         """Enable/disable minimal mode for a chat and persist."""
-        if enabled == (chat_id in self._chats):
+        if enabled == self.contains(chat_id):
             return
         if enabled:
-            self._chats.add(chat_id)
+            self._verbose.discard(chat_id)
         else:
-            self._chats.discard(chat_id)
+            self._verbose.add(chat_id)
         self._persist()
         logger.info("Minimal UI mode changed", chat_id=chat_id, enabled=enabled)
 
@@ -52,7 +60,9 @@ class MinimalModeStore:
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(sorted(self._chats)), encoding="utf-8")
+            self._path.write_text(
+                json.dumps({"verbose": sorted(self._verbose)}), encoding="utf-8"
+            )
         except OSError as e:
             logger.error(f"Could not write minimal-mode file {self._path}: {e}")
 

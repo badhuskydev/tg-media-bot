@@ -59,10 +59,21 @@ class TestCacheEntryFromMessage:
         assert e["kind"] == "video" and e["file_id"] == "V1" and e["duration"] == 99
 
     def test_document(self):
-        msg = SimpleNamespace(audio=None, video=None,
+        msg = SimpleNamespace(audio=None, video=None, animation=None,
                               document=SimpleNamespace(file_id="D1"))
         assert cache_entry_from_message(msg)["kind"] == "document"
 
+    def test_animation_wins_over_document(self):
+        # Telegram fills .document on animation messages too.
+        msg = SimpleNamespace(
+            audio=None, video=None,
+            animation=SimpleNamespace(file_id="G1", width=320, height=240, duration=6),
+            document=SimpleNamespace(file_id="G1"),
+        )
+        assert cache_entry_from_message(msg) == {
+            "kind": "animation", "file_id": "G1", "width": 320, "height": 240, "duration": 6,
+        }
+
     def test_nothing_cacheable(self):
-        msg = SimpleNamespace(audio=None, video=None, document=None)
+        msg = SimpleNamespace(audio=None, video=None, animation=None, document=None)
         assert cache_entry_from_message(msg) is None

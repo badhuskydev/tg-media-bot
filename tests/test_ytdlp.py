@@ -7,6 +7,8 @@ import pytest
 import src.downloaders.ytdlp as ytdlp_module
 from src.downloaders.ytdlp import (
     YtDlpDownloader,
+    _extract_author,
+    _source_has_audio,
     friendly_error,
     parse_progress_line,
     render_progress_bar,
@@ -84,6 +86,11 @@ class TestBuildCommand:
         for flag in ("-x", "--embed-thumbnail", "--embed-metadata", "--write-info-json"):
             assert flag in cmd
         assert "mp3" in cmd
+
+    @pytest.mark.parametrize("fmt", [MediaFormat.VIDEO, MediaFormat.AUTO])
+    def test_video_writes_info_json(self, dl, tmp_path, fmt):
+        # Needed for the author/profile link in the result caption.
+        assert "--write-info-json" in dl._build_command("https://x", tmp_path, fmt)
 
     def test_video_merges_to_mp4(self, dl, tmp_path):
         cmd = dl._build_command("https://x", tmp_path, MediaFormat.VIDEO)
@@ -260,6 +267,57 @@ class TestFileDiscovery:
         data = {"title": "T", "artist": "A", "duration": 100}
         (tmp_path / "song.info.json").write_text(json.dumps(data))
         assert dl._read_info_json(tmp_path)["artist"] == "A"
+
+    def test_extract_author_prefers_uploader(self):
+        meta = {"uploader": "Up", "uploader_url": "https://u", "channel": "Ch",
+                "channel_url": "https://c"}
+        assert _extract_author(meta) == ("Up", "https://u")
+
+    def test_extract_author_falls_back_to_channel(self):
+        assert _extract_author({"channel": "Ch", "channel_url": "https://c"}) == ("Ch", "https://c")
+        # e.g. YouTube: uploader name present but only channel_url
+        assert _extract_author({"uploader": "Up", "channel_url": "https://c"}) == ("Up", "https://c")
+
+    def test_source_has_audio_true_if_any_format_has_audio(self):
+        # Reddit-style: a video-only fallback plus muxed HLS with audio.
+        meta = {"formats": [{"acodec": "none", "vcodec": "h264"},
+                            {"acodec": "mp4a.40.2", "vcodec": "avc1"}]}
+        assert _source_has_audio(meta) is True
+
+    def test_source_has_audio_false_when_all_explicitly_none(self):
+        meta = {"formats": [{"acodec": "none"}, {"acodec": "none"}]}
+        assert _source_has_audio(meta) is False
+
+    def test_source_has_audio_unknown(self):
+        # X/Twitter GIFs and direct files leave acodec unset.
+        assert _source_has_audio({"formats": [{"vcodec": "avc1"}]}) is None
+        assert _source_has_audio({"formats": [{"acodec": None}, {"acodec": "none"}]}) is None
+        assert _source_has_audio({}) is None
+
+    def test_source_has_audio_top_level_fallback(self):
+        assert _source_has_audio({"acodec": "none"}) is False
+        assert _source_has_audio({"acodec": "opus"}) is True
+
+    def test_extract_author_missing(self):
+        assert _extract_author({}) == ("", "")
+        assert _extract_author({"uploader": None, "uploader_url": None}) == ("", "")
+
+    async def test_run_download_surfaces_author(self, dl, tmp_path, monkeypatch):
+        (tmp_path / "clip.mp4").write_bytes(b"x" * 10)
+        (tmp_path / "clip.info.json").write_text(json.dumps({
+            "title": "T", "uploader": "Someone", "uploader_url": "https://x.com/someone",
+            "formats": [{"acodec": "none", "vcodec": "avc1"}],
+        }))
+
+        async def fake_exec(*_a, **_k):
+            return _FakeProc([], returncode=0)
+
+        monkeypatch.setattr(ytdlp_module.asyncio, "create_subprocess_exec", fake_exec)
+        result = await dl._run_download(["yt-dlp"], tmp_path, "twitter")
+
+        assert result.success
+        assert (result.author, result.author_url) == ("Someone", "https://x.com/someone")
+        assert result.source_has_audio is False
 
     def test_read_info_json_missing(self, dl, tmp_path):
         assert dl._read_info_json(tmp_path) == {}

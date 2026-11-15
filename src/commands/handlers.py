@@ -42,7 +42,7 @@ Send me any media URL and I'll download and send it back to you.
 /formats &lt;url&gt; - Pick a download quality (buttons)
 /cancel &lt;task_id&gt; - Cancel a download
 /status - Show your active downloads
-/minimal on|off - Toggle minimal UI (no status messages, no caption on media)
+/minimal on|off - Toggle minimal UI (default on: no status messages, just the post)
 /topic lock|unlock|status - Restrict the bot to one forum topic in this group
 
 <b>Supported Platforms:</b>
@@ -126,9 +126,9 @@ Send me any media URL and I'll download and send it back to you.
     async def cmd_minimal(self, message: types.Message):
         """Handle /minimal command - toggle minimal UI mode for this chat.
 
-        In minimal mode, downloads produce no queued/progress/"Done!" status
-        messages and the uploaded media carries no title/source-URL caption —
-        just the file itself. Failures are still reported.
+        Minimal mode is on by default: downloads produce no queued/progress/
+        "Done!" status messages — just the finished post. ``/minimal off``
+        brings the status messages back. Failures are always reported.
         """
         from ..services.minimal_store import get_minimal_store
 
@@ -153,10 +153,10 @@ Send me any media URL and I'll download and send it back to you.
         if choice == "on":
             await message.answer(
                 "🤫 Minimal UI mode enabled. Downloads will be sent with no "
-                "status messages and no caption."
+                "status messages — just the finished post."
             )
         else:
-            await message.answer("✅ Minimal UI mode disabled. Normal status messages and captions restored.")
+            await message.answer("✅ Minimal UI mode disabled. Progress and status messages restored.")
 
     async def cmd_topic(self, message: types.Message):
         """Handle /topic — restrict the bot to one forum topic in this group.

@@ -186,7 +186,7 @@ class BotHandlers:
 
         # Process download in background; keep a handle so /cancel can stop it.
         bg = asyncio.create_task(
-            self._process_download_task(task, chat_id, status_msg_id, minimal, message_thread_id)
+            self._process_download_task(task, chat_id, status_msg_id, message_thread_id)
         )
         self._running_tasks[task.task_id] = bg
         bg.add_done_callback(
@@ -208,15 +208,15 @@ class BotHandlers:
         return True
 
     async def _process_download_task(
-        self, task, chat_id: int, status_msg_id: Optional[int], minimal: bool = False,
+        self, task, chat_id: int, status_msg_id: Optional[int],
         message_thread_id: Optional[int] = None,
     ):
         """Background task to process a download.
 
         In minimal mode ``status_msg_id`` is None: routine progress/status
-        edits are skipped and the uploaded media carries no caption, but
-        failures are still reported (as a new message, since there's no
-        status message to edit).
+        edits are skipped so only the finished post appears, but failures are
+        still reported (as a new message, since there's no status message to
+        edit).
         """
         user_id = task.user_id
         user_state = self.get_user_state(user_id)
@@ -232,7 +232,7 @@ class BotHandlers:
             if cached:
                 try:
                     msg = await self.uploader.send_cached(
-                        chat_id, cached, source_url=task.url, minimal=minimal,
+                        chat_id, cached, source_url=task.url, platform=task.platform,
                         message_thread_id=message_thread_id,
                     )
                     if msg:
@@ -341,7 +341,10 @@ class BotHandlers:
                     duration=result.duration,
                     thumbnail_path=result.thumbnail_path,
                     source_url=task.url,
-                    minimal=minimal,
+                    platform=task.platform,
+                    author=result.author,
+                    author_url=result.author_url,
+                    source_has_audio=result.source_has_audio,
                     message_thread_id=message_thread_id,
                 )
             finally:
@@ -371,6 +374,9 @@ class BotHandlers:
                         entry["performer"] = result.performer
                     if result.duration and not entry.get("duration"):
                         entry["duration"] = int(result.duration)
+                    # So a resend from cache gets the same caption.
+                    entry["author"] = result.author
+                    entry["author_url"] = result.author_url
                     self.cache.put(task.url, task.preferred_format.value, entry)
                 logger.download_completed(
                     user_id, task.url, task.platform,

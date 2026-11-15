@@ -146,6 +146,45 @@ def friendly_error(raw: str) -> str:
     return cleaned[:300] if cleaned else "Download failed."
 
 
+def _extract_author(meta: dict) -> Tuple[str, str]:
+    """(author name, profile URL) from yt-dlp metadata.
+
+    Prefers ``uploader``/``uploader_url`` and falls back to
+    ``channel``/``channel_url`` field-by-field (e.g. YouTube often has a
+    channel_url but no uploader_url). Either may come back empty.
+    """
+    name = meta.get("uploader") or meta.get("channel") or ""
+    url = meta.get("uploader_url") or meta.get("channel_url") or ""
+    return str(name).strip(), str(url).strip()
+
+
+def _source_has_audio(meta: dict) -> Optional[bool]:
+    """Whether the source media offers sound, per yt-dlp's format metadata.
+
+    Looks at every format the source offers (not just the one downloaded),
+    so a silent file produced by a video-only format fallback isn't mistaken
+    for a silent source. Returns:
+
+    - True  — some format has an audio codec;
+    - False — formats are listed and all explicitly say ``acodec: "none"``
+      (e.g. Reddit/Instagram/TikTok video with no sound);
+    - None  — unknown: no format info, or extractors that leave acodec unset
+      (e.g. X/Twitter GIFs, direct file URLs).
+    """
+    formats = [f for f in meta.get("formats") or [] if isinstance(f, dict)]
+    formats += [f for f in meta.get("requested_formats") or [] if isinstance(f, dict)]
+    if not formats and "acodec" in meta:
+        formats = [meta]
+    if not formats:
+        return None
+    acodecs = [f.get("acodec") for f in formats]
+    if any(a not in (None, "none") for a in acodecs):
+        return True
+    if all(a == "none" for a in acodecs):
+        return False
+    return None
+
+
 @dataclass
 class DownloadResult:
     """Result of a download operation."""
@@ -159,6 +198,12 @@ class DownloadResult:
     error: str = ""
     performer: str = ""
     thumbnail_path: Optional[Path] = None
+    # Who posted it (yt-dlp uploader, falling back to channel) — shown in the
+    # result caption as "Post by AUTHOR on PLATFORM".
+    author: str = ""
+    author_url: str = ""
+    # Does the source offer sound? None = unknown (see _source_has_audio).
+    source_has_audio: Optional[bool] = None
 
 
 class YtDlpDownloader:
@@ -746,11 +791,12 @@ class YtDlpDownloader:
 
             file_size = output_file.stat().st_size
 
-            # Collect cover art + metadata (audio downloads write these)
+            # Collect cover art + metadata (from the .info.json sidecar)
             thumbnail_file = self._find_thumbnail(output_dir)
             meta = self._read_info_json(output_dir)
             title = meta.get("track") or meta.get("title") or output_file.stem
             performer = meta.get("artist") or meta.get("uploader") or ""
+            author, author_url = _extract_author(meta)
             try:
                 duration = float(meta.get("duration") or 0.0)
             except (TypeError, ValueError):
@@ -765,6 +811,9 @@ class YtDlpDownloader:
                 duration=duration,
                 thumbnail_path=thumbnail_file,
                 platform=platform,
+                author=author,
+                author_url=author_url,
+                source_has_audio=_source_has_audio(meta),
             )
 
         except asyncio.CancelledError:
@@ -870,9 +919,6 @@ class YtDlpDownloader:
                 # Bake cover art + tags into the mp3 itself
                 "--embed-thumbnail",
                 "--embed-metadata",
-                # Sidecar metadata so we can read title/artist/duration without
-                # a second network call (used to set the Telegram audio fields)
-                "--write-info-json",
             ])
         else:
             # VIDEO and AUTO behave identically: best video+audio, merged to mp4,
@@ -901,6 +947,11 @@ class YtDlpDownloader:
         # _prepare_thumbnail() in uploader.py does its own plain, format-
         # agnostic ffmpeg conversion downstream instead.
         cmd.append("--write-thumbnail")
+
+        # Sidecar metadata (all formats) so we can read title/artist/duration
+        # and the author/profile link for the caption without a second
+        # network call.
+        cmd.append("--write-info-json")
 
         # Per-connection network stall timeout
         cmd.extend([

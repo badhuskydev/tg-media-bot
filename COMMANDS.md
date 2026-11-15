@@ -47,7 +47,7 @@ Send me any media URL and I'll download and send it back to you.
 /formats <url> - Pick a download quality (buttons)
 /cancel <task_id> - Cancel a download
 /status - Show your active downloads
-/minimal on|off - Toggle minimal UI (no status messages, no caption on media)
+/minimal on|off - Toggle minimal UI (default on: no status messages, just the post)
 /topic lock|unlock|status - Restrict the bot to one forum topic in this group
 
 <b>Supported Platforms:</b>
@@ -187,9 +187,10 @@ Active: 2/2
 
 ### `/minimal on|off`
 
-Toggle minimal UI mode for the current chat: no queued/progress/"Done!"
-status messages, and uploaded media carries no title/source-URL caption —
-just the file itself. Failures are still reported.
+Toggle minimal UI mode for the current chat. Minimal mode is **on by
+default**: no queued/progress/"Done!" status messages — just the finished
+post. `/minimal off` brings the status messages back. Failures are always
+reported.
 
 **Usage:**
 ```
@@ -200,14 +201,14 @@ just the file itself. Failures are still reported.
 
 **Response:**
 ```
-🤫 Minimal UI mode enabled. Downloads will be sent with no status messages and no caption.
+🤫 Minimal UI mode enabled. Downloads will be sent with no status messages — just the finished post.
 ```
 
 Run with no argument to see the current state instead of changing it.
 
 **Notes:**
 - Per-chat, not per-user — affects everyone using the bot in that chat.
-- Persists across restarts if `MINIMAL_MODE_FILE` is set.
+- Persists across restarts if `MINIMAL_MODE_FILE` is set (only chats that turned it off are stored).
 
 ---
 
@@ -298,8 +299,8 @@ rickroll.mp4
 Size: 12.5MB
 ```
 
-In minimal mode (`/minimal on`), none of the above status messages appear —
-only the final file, with no caption. Failures are still reported.
+The status messages above only appear after `/minimal off`. In minimal mode
+(the default) only the finished post appears. Failures are still reported.
 
 ### Error Messages
 
