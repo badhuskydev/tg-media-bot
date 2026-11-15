@@ -2,6 +2,7 @@
 
 import asyncio
 import html
+import json
 from pathlib import Path
 from typing import Awaitable, Callable, Optional, TypeVar, Union
 
@@ -83,6 +84,37 @@ def cache_entry_from_message(message: Message) -> Optional[dict]:
     if message.document:
         return {"kind": "document", "file_id": message.document.file_id}
     return None
+
+
+async def _probe_dimensions(src: Path) -> tuple[Optional[int], Optional[int]]:
+    """Return (width, height) of the first video stream, honoring rotation.
+
+    Telegram does not reliably derive dimensions from the file, so without
+    them it guesses (often from the thumbnail) and renders the wrong aspect.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate",
+            "-of", "json", str(src),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        streams = json.loads(out or b"{}").get("streams") or []
+        if not streams:
+            return None, None
+        st = streams[0]
+        w, h = st.get("width"), st.get("height")
+        rot = (st.get("tags") or {}).get("rotate")
+        for sd in st.get("side_data_list") or []:
+            if "rotation" in sd:
+                rot = sd["rotation"]
+        if rot is not None and abs(int(float(rot))) % 180 == 90:
+            w, h = h, w
+        return w, h
+    except Exception as e:  # best-effort; upload proceeds without dimensions
+        logger.debug(f"ffprobe dimensions failed: {e}")
+        return None, None
 
 
 async def _prepare_thumbnail(src: Path) -> Optional[Path]:
@@ -173,6 +205,7 @@ class UploaderService:
             return None
 
         thumb = await _prepare_thumbnail(thumbnail_path) if thumbnail_path else None
+        width, height = await _probe_dimensions(file_path)
 
         try:
             input_file = InputFile(file_path)
@@ -183,6 +216,8 @@ class UploaderService:
                 caption=None if minimal else _build_caption(caption, source_url),
                 parse_mode="HTML",
                 duration=int(duration) if duration else None,
+                width=width,
+                height=height,
                 thumbnail=InputFile(thumb) if thumb else None,
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=message_thread_id,
