@@ -30,6 +30,7 @@ This bot downloads media from 1000+ platforms using yt-dlp and uploads the files
 - Audio results are a single post: MP3 with embedded cover art, album-art thumbnail, and title/artist/duration
 - Each result post is captioned *Post by AUTHOR on PLATFORM*, linking the original post and the author's profile
 - Short clips (under 60s) whose source has no sound are sent as animations, so they autoplay and loop like a GIF
+- Image posts (a tweet with photos, an Instagram carousel, a Reddit gallery, a TikTok slideshow) are fetched with gallery-dl when yt-dlp finds no video, and sent as a photo or album; X posts mixing videos and photos are sent whole
 - Authenticated downloads via browser cookies (bare Python) or a mounted `cookies.txt` (Docker)
 - Handles split video+audio sources (HLS/DASH) that have no single muxed stream
 - Optional headless-browser fallback: when no yt-dlp extractor can handle a page whose player builds the media URL in JavaScript, the page is loaded in headless Chromium, the media request is captured, and that URL is handed back to yt-dlp
@@ -54,7 +55,8 @@ tg-media-bot/
 │   ├── config/
 │   │   └── settings.py  # Env-based settings (singleton)
 │   ├── downloaders/
-│   │   └── ytdlp.py     # yt-dlp subprocess wrapper
+│   │   ├── ytdlp.py     # yt-dlp subprocess wrapper
+│   │   └── gallerydl.py # gallery-dl wrapper (image-post fallback)
 │   ├── queue/
 │   │   └── manager.py   # Async queue + per-user rate limiting
 │   ├── services/
@@ -63,7 +65,7 @@ tg-media-bot/
 │   │   ├── media_cache.py   # file_id cache for instant resends
 │   │   ├── minimal_store.py # Per-chat minimal-UI toggle
 │   │   ├── topic_lock.py    # Per-chat forum-topic restriction
-│   │   └── uploader.py      # Telegram upload (video/audio/document)
+│   │   └── uploader.py      # Telegram upload (video/audio/photo/album/document)
 │   ├── types/
 │   │   └── download.py  # DownloadTask, DownloadStatus, MediaFormat
 │   └── utils/
@@ -145,7 +147,9 @@ nix build .#with-browser                  # + headless-Chromium fallback (large)
 nix develop                               # dev shell with deps + pytest
 ```
 
-`yt-dlp` and `ffmpeg` are put on the bot's `PATH` by the wrapper; yt-dlp comes
+`yt-dlp` and `ffmpeg` are put on the bot's `PATH` by the wrapper (gallery-dl,
+for the image-post fallback, isn't wired into the Nix package yet — without it
+image posts just report the original "no video" error); yt-dlp comes
 from nixpkgs, so bump it with `nix flake update`. For home-manager, import
 `homeManagerModules.default` and enable `services.tg-media-bot` — it runs a user
 service, keeps state under `~/.local/state/tg-media-bot`, and reads `BOT_TOKEN`
@@ -185,6 +189,7 @@ All settings are loaded from `.env` (see `src/config/settings.py`).
 | `BROWSER_FALLBACK_TIMEOUT` | no | `45` | Seconds the fallback waits for the page to load and start playing |
 | `BOT_API_HOST_PORT` | no | `8082` | Docker only: host port for the local Bot API server |
 | `YTDLP_AUTO_UPDATE` | no | `true` | Docker only: refresh yt-dlp to the latest release on container start |
+| `GALLERYDL_AUTO_UPDATE` | no | same as `YTDLP_AUTO_UPDATE` | Docker only: refresh gallery-dl (image-post fallback) on container start |
 
 The headless-browser fallback needs a Chromium binary in the image, which is **opt-in** (it adds ~450 MB). Build with it by setting `INSTALL_BROWSER=true` in `.env` before `docker compose build` (the compose file forwards it as the `INSTALL_BROWSER` build arg), or `docker build --build-arg INSTALL_BROWSER=true`. On the bare-Python/AUR install, run `playwright install chromium` once. Without Chromium the fallback simply no-ops and the bot reports the original failure.
 
@@ -255,6 +260,7 @@ Notes:
 - **Audio posts** are a single message: the MP3 with embedded cover art, an album-art thumbnail in the player, title/artist/duration tags, and the standard caption. (Telegram doesn't allow a standalone photo and an audio file in one post, so the cover rides along as the player thumbnail.)
 - **SoundCloud links are always audio** — no need to send `/audio` first.
 - **Every post** is captioned *[Post](#) by [AUTHOR](#) on PLATFORM* (italic): "Post" links to the original, the author name (from yt-dlp's uploader, falling back to channel) links to their profile. With no known author it's just *Post on PLATFORM*.
+- **Image posts:** when yt-dlp reports a post has no video, the bot falls back to gallery-dl. TikTok photo posts (slideshows) go to gallery-dl directly, without their background music. For X posts, a metadata-only gallery-dl check runs alongside the yt-dlp download; if the post also has photos, the whole post is fetched with gallery-dl so they aren't dropped (skipped for `/audio` and `/formats` picks). One image is sent as a photo; 2-10 items as one album; more are split into albums of up to 10. Images and videos from the same post share an album. Images over 10 MB or beyond Telegram's photo dimension limits are sent as files (uncompressed) after the album. Uses `COOKIES_FILE` when set.
 - **Short silent clips** (under 60s, where the source itself has no sound per yt-dlp's format info, or the file has no audio track when the source doesn't say) are sent as animations so they autoplay and loop like a GIF.
 - **Minimal mode is the default:** no queued/progress/"Done!" messages, just the finished post. `/minimal off` restores them for a chat.
 

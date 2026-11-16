@@ -10,13 +10,24 @@ from aiogram import Bot, types
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 
 from ..config import get_settings
-from ..downloaders import YtDlpDownloader
-from ..downloaders.ytdlp import friendly_error, render_progress_bar
+from ..downloaders import GalleryDlDownloader, YtDlpDownloader
+from ..downloaders.gallerydl import (
+    is_no_video_error,
+    is_tiktok_photo_error,
+    is_tiktok_photo_url,
+    is_x_post_url,
+)
+from ..downloaders.ytdlp import DownloadResult, friendly_error, render_progress_bar
 from ..queue import get_queue_manager
 from ..services.cleanup import get_cleanup_service
 from ..services.media_cache import get_media_cache
 from ..services.minimal_store import get_minimal_store
-from ..services.uploader import UploaderService, cache_entry_from_message, with_flood_retry
+from ..services.uploader import (
+    UploaderService,
+    cache_entry_from_message,
+    cache_entry_from_messages,
+    with_flood_retry,
+)
 from ..types.download import DownloadStatus, MediaFormat
 from ..utils.logger import get_logger
 
@@ -47,6 +58,7 @@ class BotHandlers:
         self.cache = get_media_cache()
         self.minimal_store = get_minimal_store()
         self.downloader = YtDlpDownloader()
+        self.gallery = GalleryDlDownloader()
         self.uploader = UploaderService(bot)
         self._user_states: dict[int, DownloadState] = {}
         # task_id -> the background asyncio.Task running the download, so /cancel
@@ -293,14 +305,8 @@ class BotHandlers:
                 text += f"\nTask: `{task.task_id}`"
                 await self._update_status_message(chat_id, status_msg_id, text)
 
-            # Download
-            result = await self.downloader.download(
-                url=task.url,
-                output_dir=temp_dir,
-                preferred_format=task.preferred_format,
-                progress_callback=on_progress,
-                max_height=task.max_height,
-            )
+            # Download (yt-dlp, falling back to gallery-dl for image posts)
+            result = await self._download(task, temp_dir, on_progress)
 
             if not result.success:
                 await self._notify_error(
@@ -331,22 +337,54 @@ class BotHandlers:
                 if status_msg_id is not None
                 else None
             )
+            platform = result.platform or task.platform
+            entry = None
             try:
-                upload_result = await self.uploader.upload_media(
-                    chat_id=chat_id,
-                    file_path=result.output_path,
-                    media_format=task.preferred_format,
-                    title=result.title,
-                    performer=result.performer,
-                    duration=result.duration,
-                    thumbnail_path=result.thumbnail_path,
-                    source_url=task.url,
-                    platform=task.platform,
-                    author=result.author,
-                    author_url=result.author_url,
-                    source_has_audio=result.source_has_audio,
-                    message_thread_id=message_thread_id,
-                )
+                if result.files:
+                    gallery = await self.uploader.upload_gallery(
+                        chat_id=chat_id,
+                        files=result.files,
+                        source_url=task.url,
+                        platform=platform,
+                        author=result.author,
+                        author_url=result.author_url,
+                        message_thread_id=message_thread_id,
+                    )
+                    upload_result = gallery.messages[0] if gallery.messages else None
+                    if gallery.complete:
+                        entry = cache_entry_from_messages(gallery.messages)
+                    elif upload_result:
+                        # Some albums went out, some didn't: say so, and don't
+                        # cache a partial post.
+                        await self._notify_error(
+                            chat_id, None,
+                            "⚠️ Some items from this post couldn't be uploaded.",
+                            message_thread_id,
+                        )
+                else:
+                    upload_result = await self.uploader.upload_media(
+                        chat_id=chat_id,
+                        file_path=result.output_path,
+                        media_format=task.preferred_format,
+                        title=result.title,
+                        performer=result.performer,
+                        duration=result.duration,
+                        thumbnail_path=result.thumbnail_path,
+                        source_url=task.url,
+                        platform=platform,
+                        author=result.author,
+                        author_url=result.author_url,
+                        source_has_audio=result.source_has_audio,
+                        message_thread_id=message_thread_id,
+                    )
+                    if upload_result:
+                        entry = cache_entry_from_message(upload_result)
+                        if entry is not None:
+                            entry["title"] = entry.get("title") or result.title or ""
+                            if result.performer and not entry.get("performer"):
+                                entry["performer"] = result.performer
+                            if result.duration and not entry.get("duration"):
+                                entry["duration"] = int(result.duration)
             finally:
                 if hb is not None:
                     hb.cancel()
@@ -366,17 +404,12 @@ class BotHandlers:
                     str(result.output_path),
                     result.file_size,
                 )
-                # Cache the file_id so repeat requests are resent instantly.
-                entry = cache_entry_from_message(upload_result)
+                # Cache the file_id(s) so repeat requests are resent instantly.
                 if entry is not None:
-                    entry["title"] = entry.get("title") or result.title or ""
-                    if result.performer and not entry.get("performer"):
-                        entry["performer"] = result.performer
-                    if result.duration and not entry.get("duration"):
-                        entry["duration"] = int(result.duration)
                     # So a resend from cache gets the same caption.
                     entry["author"] = result.author
                     entry["author_url"] = result.author_url
+                    entry["platform"] = platform
                     self.cache.put(task.url, task.preferred_format.value, entry)
                 logger.download_completed(
                     user_id, task.url, task.platform,
@@ -431,6 +464,67 @@ class BotHandlers:
                 self.queue.release_slot()
             success, count = self.cleanup.cleanup_task_dir(temp_dir)
             logger.cleanup_completed(task.task_id, success, count)
+
+    async def _download(self, task, temp_dir, on_progress) -> DownloadResult:
+        """Download with yt-dlp, using gallery-dl for what yt-dlp can't do:
+
+        - TikTok photo posts (``/photo/`` links) go straight to gallery-dl;
+          yt-dlp has no extractor for them.
+        - If yt-dlp reports the post has no video (an image post), or a TikTok
+          short link turns out to be a photo post, fall back to gallery-dl.
+        - X posts: yt-dlp only fetches the videos, so a post mixing videos and
+          photos would lose its photos. A metadata-only gallery-dl listing runs
+          alongside the download; if the post has photos, gallery-dl fetches
+          the whole post instead. Skipped for /audio and /formats requests,
+          since gallery-dl can't honor a format or quality choice.
+
+        If a fallback fails (or gallery-dl isn't installed), the yt-dlp
+        result is returned; gallery-dl's own error is only logged.
+        """
+        if is_tiktok_photo_url(task.url):
+            logger.info("TikTok photo post — using gallery-dl", task_id=task.task_id)
+            return await self.gallery.download(task.url, temp_dir)
+
+        photo_check = None
+        if (is_x_post_url(task.url)
+                and task.preferred_format != MediaFormat.AUDIO
+                and not task.max_height):
+            photo_check = asyncio.create_task(self.gallery.has_photos(task.url))
+
+        try:
+            result = await self.downloader.download(
+                url=task.url,
+                output_dir=temp_dir,
+                preferred_format=task.preferred_format,
+                progress_callback=on_progress,
+                max_height=task.max_height,
+            )
+
+            if result.success:
+                if photo_check is None or not await photo_check:
+                    return result
+                logger.info("X post mixes videos and photos — using gallery-dl",
+                            task_id=task.task_id)
+                gallery = await self.gallery.download(task.url, temp_dir)
+                if gallery.success:
+                    return gallery
+                logger.info(f"gallery-dl failed, sending videos only: {gallery.error}",
+                            task_id=task.task_id)
+                return result
+
+            if not (is_no_video_error(result.error)
+                    or is_tiktok_photo_error(task.url, result.error)):
+                return result
+        finally:
+            if photo_check is not None and not photo_check.done():
+                photo_check.cancel()
+
+        logger.info("No video in post — trying gallery-dl", task_id=task.task_id)
+        gallery = await self.gallery.download(task.url, temp_dir)
+        if gallery.success:
+            return gallery
+        logger.info(f"gallery-dl fallback failed: {gallery.error}", task_id=task.task_id)
+        return result
 
     async def _upload_heartbeat(self, chat_id, status_msg_id, task_id, size_bytes):
         """Edit the status message with elapsed time + size while uploading.

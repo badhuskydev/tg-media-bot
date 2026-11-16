@@ -8,6 +8,7 @@
 - Python 3.10+
 - yt-dlp
 - ffmpeg
+- gallery-dl (optional; installed by `requirements.txt` — enables image posts)
 - Telegram Bot Token
 
 ### Required Skills

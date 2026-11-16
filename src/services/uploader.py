@@ -5,12 +5,18 @@ import html
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, TypeVar
+from typing import Awaitable, Callable, List, Optional, TypeVar, Union
 from urllib.parse import urlparse
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import FSInputFile as InputFile, InputMedia, Message
+from aiogram.types import (
+    FSInputFile as InputFile,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 
 from ..types.download import MediaFormat
 from ..utils.logger import get_logger
@@ -61,6 +67,13 @@ _PLATFORM_NAMES = {
     "instagram": "Instagram",
     "reddit": "Reddit",
     "twitch": "Twitch",
+    # gallery-dl extractor categories (image-post fallback)
+    "bluesky": "Bluesky",
+    "tumblr": "Tumblr",
+    "imgur": "Imgur",
+    "pixiv": "pixiv",
+    "deviantart": "DeviantArt",
+    "pinterest": "Pinterest",
 }
 
 # Longest author name shown in a caption. Telegram's 1024-char caption limit
@@ -139,9 +152,42 @@ def cache_entry_from_message(message: Message) -> Optional[dict]:
     if message.video:
         return {"kind": "video", "file_id": message.video.file_id,
                 "duration": message.video.duration or 0}
+    if getattr(message, "photo", None):
+        # Telegram returns several sizes; the last is the largest.
+        return {"kind": "photo", "file_id": message.photo[-1].file_id}
     if message.document:
         return {"kind": "document", "file_id": message.document.file_id}
     return None
+
+
+def _album_item_from_message(message: Message) -> Optional[dict]:
+    """One album member (photo/video/document) as a cacheable dict."""
+    if getattr(message, "photo", None):
+        return {"type": "photo", "file_id": message.photo[-1].file_id}
+    if message.video:
+        v = message.video
+        return {"type": "video", "file_id": v.file_id, "width": v.width or 0,
+                "height": v.height or 0, "duration": v.duration or 0}
+    if message.document:
+        return {"type": "document", "file_id": message.document.file_id}
+    return None
+
+
+def cache_entry_from_messages(messages: List[Message]) -> Optional[dict]:
+    """Cache entry for an image-post upload (see UploaderService.upload_gallery).
+
+    A single message is cached like any other upload; several become a
+    ``gallery`` entry whose ``items`` are in send order, so send_cached can
+    regroup them into the same albums. None if anything isn't cacheable.
+    """
+    if not messages:
+        return None
+    if len(messages) == 1:
+        return cache_entry_from_message(messages[0])
+    items = [_album_item_from_message(m) for m in messages]
+    if any(i is None for i in items):
+        return None
+    return {"kind": "gallery", "items": items}
 
 
 @dataclass
@@ -227,6 +273,84 @@ def _is_animation(
     if source_has_audio is None:
         return probe.has_audio is False
     return source_has_audio is False
+
+
+# --- Image posts (gallery-dl fallback) ---------------------------------------
+
+# Telegram's send_photo limits: 10 MB, width + height <= 10000, aspect ratio
+# <= 20. Anything beyond is sent as a document so it isn't rejected (and
+# isn't recompressed).
+_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+_PHOTO_MAX_DIM_SUM = 10000
+_PHOTO_MAX_RATIO = 20
+
+# Telegram media groups hold 2-10 items.
+_ALBUM_MAX = 10
+
+_PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+# Videos Telegram plays inline inside an album; other video containers
+# (e.g. .webm) go as documents.
+_ALBUM_VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
+# Audio can't share an album with photos/videos (e.g. a TikTok slideshow's
+# background track); it's skipped.
+_SKIPPED_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"}
+
+
+@dataclass
+class _Item:
+    """One photo/video/document to send, by local file or cached file_id."""
+
+    kind: str  # "photo" | "video" | "document"
+    media: Union[InputFile, str]
+    path: Optional[Path] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration: Optional[int] = None
+
+
+@dataclass
+class GalleryUpload:
+    """Outcome of upload_gallery: every message sent, and whether all items made it."""
+
+    messages: List[Message]
+    complete: bool
+
+
+def _photo_fits(size_bytes: int, width: Optional[int], height: Optional[int]) -> bool:
+    """Within send_photo's limits? Unknown dimensions are given the benefit
+    of the doubt (a rejection falls back to documents)."""
+    if size_bytes > _PHOTO_MAX_BYTES:
+        return False
+    if width and height:
+        if width + height > _PHOTO_MAX_DIM_SUM:
+            return False
+        if max(width, height) / min(width, height) > _PHOTO_MAX_RATIO:
+            return False
+    return True
+
+
+def _chunk(items: list, size: int = _ALBUM_MAX) -> List[list]:
+    """Split into the fewest groups of at most ``size``, as evenly as possible
+    (11 → 6 + 5), so no group is a lone leftover item."""
+    if not items:
+        return []
+    n_groups = -(-len(items) // size)
+    base, extra = divmod(len(items), n_groups)
+    groups, start = [], 0
+    for i in range(n_groups):
+        end = start + base + (1 if i < extra else 0)
+        groups.append(items[start:end])
+        start = end
+    return groups
+
+
+def _plan_groups(items: List[_Item]) -> List[List[_Item]]:
+    """Albums to send, in order. Photos and videos share albums (Telegram
+    allows mixing them); documents can only be grouped with documents, so
+    they follow in their own album(s)."""
+    visual = [i for i in items if i.kind in ("photo", "video")]
+    docs = [i for i in items if i.kind == "document"]
+    return _chunk(visual) + _chunk(docs)
 
 
 async def _prepare_thumbnail(src: Path) -> Optional[Path]:
@@ -585,6 +709,146 @@ class UploaderService:
             message_thread_id=message_thread_id,
         )
 
+    async def _local_item(self, path: Path) -> _Item:
+        """Classify a downloaded file as photo / album video / document."""
+        suffix = path.suffix.lower()
+        if suffix in _PHOTO_EXTS:
+            probe = await _probe_video(path)  # ffprobe reads image dimensions too
+            if _photo_fits(path.stat().st_size, probe.width, probe.height):
+                return _Item("photo", InputFile(path), path, probe.width, probe.height)
+            return _Item("document", InputFile(path), path)
+        if suffix in _ALBUM_VIDEO_EXTS:
+            probe = await _probe_video(path)
+            dur = int(round(probe.duration)) if probe.duration else None
+            return _Item("video", InputFile(path), path, probe.width, probe.height, dur)
+        return _Item("document", InputFile(path), path)
+
+    @staticmethod
+    def _input_media(item: _Item, caption: Optional[str]):
+        if item.kind == "photo":
+            return InputMediaPhoto(media=item.media, caption=caption, parse_mode="HTML")
+        if item.kind == "video":
+            return InputMediaVideo(
+                media=item.media, caption=caption, parse_mode="HTML",
+                width=item.width or None, height=item.height or None,
+                duration=item.duration or None, supports_streaming=True,
+            )
+        return InputMediaDocument(media=item.media, caption=caption, parse_mode="HTML")
+
+    async def _send_group(
+        self,
+        chat_id: int,
+        group: List[_Item],
+        caption: Optional[str],
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> List[Message]:
+        """Send one album (or a single item: media groups need 2+). The
+        caption goes on the first item. Raises on failure."""
+        if len(group) == 1:
+            item = group[0]
+            common = dict(
+                chat_id=chat_id, caption=caption, parse_mode="HTML",
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+            )
+            if item.kind == "photo":
+                msg = await with_flood_retry(
+                    lambda: self.bot.send_photo(photo=item.media, **common))
+            elif item.kind == "video":
+                msg = await with_flood_retry(lambda: self.bot.send_video(
+                    video=item.media, width=item.width or None,
+                    height=item.height or None, duration=item.duration or None,
+                    supports_streaming=True, **common,
+                ))
+            else:
+                msg = await with_flood_retry(
+                    lambda: self.bot.send_document(document=item.media, **common))
+            return [msg]
+
+        media = [
+            self._input_media(item, caption if i == 0 else None)
+            for i, item in enumerate(group)
+        ]
+        sent = await with_flood_retry(lambda: self.bot.send_media_group(
+            chat_id=chat_id, media=media,
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
+        ))
+        return list(sent)
+
+    async def upload_gallery(
+        self,
+        chat_id: int,
+        files: List[Path],
+        source_url: Optional[str] = None,
+        platform: str = "",
+        author: str = "",
+        author_url: str = "",
+        reply_to_message_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> GalleryUpload:
+        """Send an image post's files (gallery-dl fallback).
+
+        One image → send_photo; 2-10 items → one album via send_media_group;
+        more → several albums of up to 10 (split evenly). Photos and videos
+        share albums. Images over 10 MB or past Telegram's photo dimension
+        limits go as documents (uncompressed), grouped after the photos. A
+        lone video goes through upload_video (so it can become an animation).
+        The "Post by AUTHOR on PLATFORM" caption rides on the first item.
+
+        If Telegram rejects an album (e.g. photo dimensions ffprobe couldn't
+        read), it's resent once as documents. ``complete`` is False when some
+        items still couldn't be sent.
+        """
+        caption = _build_caption(source_url, platform, author, author_url)
+        media_files = [
+            f for f in files if f.exists() and f.suffix.lower() not in _SKIPPED_EXTS
+        ]
+        if not media_files:
+            logger.error("Image post had no sendable files", files=len(files))
+            return GalleryUpload([], False)
+
+        if len(media_files) == 1 and media_files[0].suffix.lower() in _ALBUM_VIDEO_EXTS:
+            msg = await self.upload_video(
+                chat_id=chat_id, file_path=media_files[0], caption=caption,
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+            )
+            return GalleryUpload([msg] if msg else [], msg is not None)
+
+        items = [await self._local_item(f) for f in media_files]
+        sent: List[Message] = []
+        for gi, group in enumerate(_plan_groups(items)):
+            group_caption = caption if gi == 0 else None
+            try:
+                sent += await self._send_group(
+                    chat_id, group, group_caption, reply_to_message_id, message_thread_id,
+                )
+                continue
+            except TelegramRetryAfter as e:
+                # Still rate-limited: resending as documents would hit the
+                # same per-chat limit.
+                logger.error(f"Image post upload failed (flood control): {e}")
+                return GalleryUpload(sent, False)
+            except Exception as e:
+                if all(item.kind == "document" for item in group):
+                    logger.error(f"Image post upload failed: {e}")
+                    return GalleryUpload(sent, False)
+                logger.error(f"Album rejected, resending as documents: {e}")
+
+            docs = [_Item("document", InputFile(item.path), item.path) for item in group]
+            try:
+                sent += await self._send_group(
+                    chat_id, docs, group_caption, reply_to_message_id, message_thread_id,
+                )
+            except Exception as e:
+                logger.error(f"Image post upload failed as documents too: {e}")
+                return GalleryUpload(sent, False)
+
+        logger.info("Image post uploaded", items=len(items), messages=len(sent))
+        return GalleryUpload(sent, True)
+
     async def send_cached(
         self,
         chat_id: int,
@@ -596,18 +860,34 @@ class UploaderService:
     ) -> Optional[Message]:
         """Resend a previously uploaded file by its cached file_id (instant).
 
-        The caption is rebuilt from the entry's stored author, so a resent
-        post looks the same as the original.
+        The caption is rebuilt from the entry's stored author (and platform,
+        when stored), so a resent post looks the same as the original.
+        ``gallery`` entries are regrouped into the same albums.
 
         Raises on failure (e.g. a stale file_id) so the caller can fall back to
         a fresh download.
         """
         kind = entry["kind"]
-        file_id = entry["file_id"]
         caption = _build_caption(
-            source_url, platform,
+            source_url, entry.get("platform") or platform,
             entry.get("author", ""), entry.get("author_url", ""),
         )
+
+        if kind == "gallery":
+            items = [
+                _Item(i["type"], i["file_id"], width=i.get("width") or None,
+                      height=i.get("height") or None, duration=i.get("duration") or None)
+                for i in entry["items"]
+            ]
+            sent: List[Message] = []
+            for gi, group in enumerate(_plan_groups(items)):
+                sent += await self._send_group(
+                    chat_id, group, caption if gi == 0 else None,
+                    reply_to_message_id, message_thread_id,
+                )
+            return sent[0] if sent else None
+
+        file_id = entry["file_id"]
         duration = int(entry["duration"]) if entry.get("duration") else None
 
         if kind == "audio":
@@ -629,6 +909,12 @@ class UploaderService:
             return await with_flood_retry(lambda: self.bot.send_video(
                 chat_id=chat_id, video=file_id, caption=caption, parse_mode="HTML",
                 duration=duration, supports_streaming=True,
+                reply_to_message_id=reply_to_message_id,
+                message_thread_id=message_thread_id,
+            ))
+        if kind == "photo":
+            return await with_flood_retry(lambda: self.bot.send_photo(
+                chat_id=chat_id, photo=file_id, caption=caption, parse_mode="HTML",
                 reply_to_message_id=reply_to_message_id,
                 message_thread_id=message_thread_id,
             ))

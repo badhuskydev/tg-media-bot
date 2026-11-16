@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -123,6 +123,10 @@ _ERROR_HINTS = (
     ("only available for registered", "🔑 Registered users only — set a COOKIES_FILE."),
     ("requested format is not available", "🎚️ That quality isn't available — try another via /formats."),
     ("video unavailable", "🚫 The video is unavailable (removed or not public)."),
+    # Reached only when the gallery-dl image fallback also failed.
+    ("no video could be found", "🖼️ No video in this post, and its images couldn't be downloaded."),
+    ("there is no video in this post", "🖼️ No video in this post, and its images couldn't be downloaded."),
+    ("no media found", "🖼️ No video in this post, and its images couldn't be downloaded."),
     ("unsupported url", "🤔 That link isn't a supported media URL."),
     ("unable to extract", "🤔 Couldn't read that page — the link may be wrong or unsupported."),
     ("http error 404", "🚫 Not found (404) — the link may be dead."),
@@ -204,6 +208,9 @@ class DownloadResult:
     author_url: str = ""
     # Does the source offer sound? None = unknown (see _source_has_audio).
     source_has_audio: Optional[bool] = None
+    # Every media file of a multi-file post, in post order (gallery-dl image
+    # fallback). Empty for ordinary single-file yt-dlp downloads.
+    files: List[Path] = field(default_factory=list)
 
 
 class YtDlpDownloader:
